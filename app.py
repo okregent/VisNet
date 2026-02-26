@@ -46,25 +46,110 @@ class InferencePipeline(torch.nn.Module):
         self.modelmodule.model.load_state_dict(ckpt)
         self.modelmodule.eval()
 
+    # Duration of each video segment in seconds.
+    # The model was trained on short clips (LRS3 dataset, ~1-16s),
+    # so splitting long videos into segments improves accuracy.
+    SEGMENT_DURATION = 5
+
+    # Minimum number of frames required to run inference on a segment.
+    # Segments shorter than this are skipped to avoid poor predictions.
+    MIN_FRAMES = 10
+
     def load_video(self, data_filename):
+        """
+        Load a video file and return its frames as a numpy array along with FPS.
+
+        torchvision.io.read_video returns a tuple of:
+          - video frames tensor: shape (T, H, W, C)
+          - audio frames tensor
+          - metadata dict containing 'video_fps'
+
+        We convert the video tensor to numpy for downstream processing.
+        """
         import torchvision
-        return torchvision.io.read_video(data_filename, pts_unit="sec")[0].numpy()
+        frames, _, info = torchvision.io.read_video(data_filename, pts_unit="sec")
+        # Extract FPS from metadata; fall back to 25 if not available
+        fps = info.get("video_fps", 25.0)
+        return frames.numpy(), fps
+
+    def _process_segment(self, segment_frames):
+        """
+        Run the full preprocessing and inference pipeline on a single segment.
+
+        Steps:
+          1. Detect facial landmarks using RetinaFace
+          2. Crop the lip region based on landmarks
+          3. Convert to tensor and rearrange dimensions
+          4. Normalize and apply test-time transforms
+          5. Run the Conformer model to produce a transcript
+
+        Returns an empty string if face detection fails for this segment.
+        """
+        # Step 1: Detect facial landmarks for every frame in the segment.
+        # landmarks is a list of landmark arrays, one per frame.
+        landmarks = self.landmarks_detector(segment_frames)
+
+        # Step 2: Crop the lip region from each frame using the detected landmarks.
+        # Returns None if no face is detected in the segment.
+        processed = self.video_process(segment_frames, landmarks)
+        if processed is None:
+            return ""
+
+        # Step 3: Convert numpy array to PyTorch tensor.
+        # Shape after conversion: (T, H, W, C) where T=frames, C=channels
+        video_tensor = torch.tensor(processed)
+
+        # Step 4: Rearrange from (T, H, W, C) to (T, C, H, W).
+        # PyTorch's convolutional layers expect channels before spatial dims.
+        video_tensor = video_tensor.permute((0, 3, 1, 2))
+
+        # Step 5: Apply normalization and center crop (defined in VideoTransform).
+        video_tensor = self.video_transform(video_tensor)
+
+        # Step 6: Run inference without computing gradients.
+        # torch.no_grad() saves memory and speeds up inference
+        # since we don't need backpropagation at prediction time.
+        with torch.no_grad():
+            transcript = self.modelmodule(video_tensor)
+
+        return transcript.strip()
 
     def forward(self, data_filename):
+        """
+        Full inference pipeline for a video file.
+
+        To handle videos longer than what the model was trained on,
+        we split the video into fixed-length segments, run inference
+        on each segment independently, and join the results.
+        """
         data_filename = os.path.abspath(data_filename)
         assert os.path.isfile(data_filename), f"data_filename: {data_filename} does not exist."
 
-        video = self.load_video(data_filename)
-        landmarks = self.landmarks_detector(video)
-        video = self.video_process(video, landmarks)
-        video = torch.tensor(video)
-        video = video.permute((0, 3, 1, 2))
-        video = self.video_transform(video)
-        
-        with torch.no_grad():
-            transcript = self.modelmodule(video)
+        # Load all video frames and the actual FPS of the video
+        video, fps = self.load_video(data_filename)
 
-        return transcript
+        # Calculate how many frames correspond to SEGMENT_DURATION seconds
+        segment_size = int(fps * self.SEGMENT_DURATION)
+
+        total_frames = len(video)
+        transcripts = []
+
+        # Slide through the video in steps of segment_size
+        for start in range(0, total_frames, segment_size):
+            end = min(start + segment_size, total_frames)
+            segment = video[start:end]
+
+            # Skip segments that are too short for reliable inference
+            if len(segment) < self.MIN_FRAMES:
+                continue
+
+            # Run inference on this segment and collect the result
+            result = self._process_segment(segment)
+            if result:
+                transcripts.append(result)
+
+        # Join all segment transcripts with a space between them
+        return " ".join(transcripts)
 
 # Initialize the pipeline
 pipeline = InferencePipeline(args, DEFAULT_MODEL_PATH)
