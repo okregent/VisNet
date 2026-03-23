@@ -2,6 +2,10 @@
 
 VisNet is a web application that performs visual speech recognition using deep learning. Upload a video of someone speaking, and the application will transcribe the speech by analysing lip movements.
 
+## Live Demo    
+
+Try the live demo on HuggingFace Spaces: [🤗 VisNet Demo](https://huggingface.co/spaces/okregent/visnet)
+
 ## Setup Instructions
 
 ### 1. Environment Setup
